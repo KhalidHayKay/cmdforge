@@ -9,14 +9,8 @@ import (
 // CLI is the public handle the caller gets from New(). It wraps the command
 // router and the migration handler, exposing only what the caller needs:
 // Register() to add custom commands, and Start() to run.
-//
-// Previously this was all hardwired inside start.go with imports to the
-// specific project's config and storage packages. Those are gone — the caller
-// is responsible for creating the db pool and passing it in, so the package
-// has zero knowledge of how the host app connects to Postgres.
 type CLI struct {
-	cmd     *CMD
-	handler *handler
+	cmd *CMD
 }
 
 // New creates a CLI instance wired with the built-in db migration commands.
@@ -25,16 +19,14 @@ type CLI struct {
 func New(db *pgxpool.Pool, migrations []Migration) *CLI {
 	h := newHandler(db, migrations)
 	cmd := newCMD()
-
-	// Register the built-in db commands. These are the same four commands
-	// that were hardcoded in the original start.go, just wired here instead
-	// so they work with whatever migrations the caller provides.
+	// Built-in db commands.
 	cmd.add("db:migrate up", h.migrateUp, false)
 	cmd.add("db:migrate down", h.migrateDown, true)
+	cmd.add("db:migrate reset", h.migrateReset, true)
 	cmd.add("db:migrate status", h.migrationStatus, false)
 	cmd.add("db:reset", h.resetDB, true)
 
-	return &CLI{cmd: cmd, handler: h}
+	return &CLI{cmd}
 }
 
 // Register adds a custom command to the router. Use this for anything

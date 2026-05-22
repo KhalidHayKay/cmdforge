@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/joho/godotenv"
 	"github.com/khalidhaykay/cmdforge"
 )
 
@@ -37,6 +38,8 @@ var migrations = []cmdforge.Migration{
 func main() {
 	ctx := context.Background()
 
+	godotenv.Load()
+
 	// You own the db connection. The package doesn't care how you build it —
 	// env var, config file, secrets manager, whatever your project uses.
 	db, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
@@ -47,7 +50,7 @@ func main() {
 
 	cli := cmdforge.New(db, migrations)
 
-	// Register any project-specific commands on top of the built-in db ones.
+	// Register any project-specific commands on top of the built-in ones.
 	cli.Register("seed", func(ctx context.Context) {
 		log.Println("Seeding database...")
 		// your seed logic here
