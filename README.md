@@ -25,7 +25,7 @@ import (
     "os"
 
     "github.com/jackc/pgx/v5/pgxpool"
-    "github.com/yourusername/cmdforge"
+    "github.com/khalidhaykay/cmdforge"
 )
 
 var migrations = []cmdforge.Migration{
