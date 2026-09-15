@@ -1,134 +1,519 @@
 # cmdforge
 
-A lightweight CLI runner and PostgreSQL migration tool for Go projects. Ships with built-in `db:migrate` commands and lets you register any number of custom commands on top.
+A small in-app CLI and command runner for Go.
 
-Built on top of [`pgx/v5`](https://github.com/jackc/pgx).
+Use your application's existing services to run maintenance tasks, seed data, manage users, drain queues, or expose other operational commands without building a separate CLI application.
 
----
+**`Register` is the primary way to add commands. `Extension` and `Use` provide an optional way to group and compose related commands.**
+
+> cmdforge owns commands and composition. Integrations own their underlying behavior. The consuming application owns resources and configuration.
 
 ## Install
 
-```bash
+```sh
 go get github.com/khalidhaykay/cmdforge
 ```
 
----
+> **Go version:** This module currently requires Go 1.26 or newer because of the Goose version used by the optional migration integration.
 
-## Usage
+The core `cmdforge` package itself uses only the Go standard library and has no database dependencies.
+
+## Quick start
 
 ```go
 package main
 
 import (
     "context"
-    "log"
-    "os"
+    "fmt"
 
-    "github.com/jackc/pgx/v5/pgxpool"
     "github.com/khalidhaykay/cmdforge"
 )
 
-var migrations = []cmdforge.Migration{
-    {
-        Name: "000001_create_users_table",
-        Up:   `CREATE TABLE users (id BIGSERIAL PRIMARY KEY, email TEXT NOT NULL UNIQUE);`,
-        Down: `DROP TABLE IF EXISTS users CASCADE;`,
-    },
+func main() {
+    cli := cmdforge.New()
+
+    cli.Register("hello", func(ctx context.Context) {
+        fmt.Println("Hello from cmdforge")
+    }, false)
+
+    cli.Start(context.Background())
+}
+```
+
+Run the command through your application:
+
+```sh
+go run . list
+go run . hello
+```
+
+`New()` includes a built-in `list` command that prints the registered command names.
+
+That's the basic cmdforge model:
+
+```text
+New
+ ↓
+Register
+ ↓
+Start
+```
+
+## Registering commands
+
+`Register` is the primary API for adding commands:
+
+```go
+cli := cmdforge.New()
+
+cli.Register("cache:clear", func(ctx context.Context) {
+    cache.Clear(ctx)
+}, false)
+
+cli.Register("user:create", func(ctx context.Context) {
+    users.Create(ctx)
+}, false)
+
+cli.Start(ctx)
+```
+
+Handlers have the signature:
+
+```go
+func(context.Context)
+```
+
+and receive the context passed to `Start`.
+
+Command names may contain spaces:
+
+```go
+cli.Register("queue drain", drainQueue, false)
+```
+
+Cmdforge performs exact command matching. It does not provide flag or argument parsing.
+
+### Destructive commands
+
+The final argument to `Register` marks a command as destructive:
+
+```go
+cli.Register("cache:purge", purgeCache, true)
+```
+
+Before executing a destructive command, cmdforge asks the user to type `yes`. Any other response aborts execution.
+
+### Duplicate registrations
+
+Registering an existing command name replaces its current handler and destructive setting.
+
+This allows commands to be deliberately overridden, but also means extensions can replace previously registered commands with the same name. Be deliberate when composing command groups that may share command names.
+
+## Grouping commands with extensions
+
+For larger applications, related commands can optionally be grouped into an `Extension`.
+
+An extension is deliberately small:
+
+```go
+type Extension interface {
+    Register(*CLI)
+}
+```
+
+For example:
+
+```go
+type UserCommands struct {
+    Create func(context.Context)
+    Delete func(context.Context)
 }
 
-func main() {
-    ctx := context.Background()
+func (u UserCommands) Register(cli *cmdforge.CLI) {
+    cli.Register("user:create", u.Create, false)
+    cli.Register("user:delete", u.Delete, true)
+}
+```
 
-    db, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
-    if err != nil {
+Then compose it with the CLI:
+
+```go
+appCommands := UserCommands{
+    Create: createUser,
+    Delete: deleteUser,
+}
+
+cli := cmdforge.New()
+
+cli.Register("cache:clear", clearCache, false)
+cli.Use(appCommands)
+
+cli.Start(ctx)
+```
+
+`Use` is simply:
+
+```go
+func (c *CLI) Use(extension Extension) {
+    extension.Register(c)
+}
+```
+
+There are no lifecycle hooks, initialization phases, dependency resolution, or plugin machinery.
+
+Extensions are optional. Calling `Register` directly is always valid.
+
+Multiple related command groups can be composed in the same way:
+
+```go
+cli.Use(userCommands)
+cli.Use(queueCommands)
+cli.Use(migrator)
+```
+
+## Goose migrations
+
+Cmdforge does not implement database migrations itself.
+
+The optional `github.com/khalidhaykay/cmdforge/goose` package integrates [Goose](https://github.com/pressly/goose) with cmdforge, exposing Goose migrations through the same in-app CLI used for the rest of your application's commands.
+
+```text
+cmdforge
+    │
+    └── Use(migrator)
+            │
+            ▼
+      cmdforge/goose
+            │
+            ▼
+      Goose Provider
+            │
+            ▼
+          *sql.DB
+```
+
+The contract is intentionally small:
+
+> **You provide the database connection and migration filesystem; cmdforge wires them into Goose commands.**
+
+The application creates and owns its `*sql.DB` and supplies an `fs.FS` containing normal Goose SQL migration files.
+
+The extension does not:
+
+- read your environment or configuration
+- open a database connection
+- create a connection pool
+- close the supplied database
+- manage your application's runtime database abstraction
+
+The integration uses Goose's PostgreSQL dialect and accepts a caller-provided `*sql.DB`. The examples below use pgx as the `database/sql` driver.
+
+### PostgreSQL setup
+
+If your application uses pgx:
+
+```sh
+go get github.com/jackc/pgx/v5
+```
+
+Import its `database/sql` driver:
+
+```go
+import _ "github.com/jackc/pgx/v5/stdlib"
+```
+
+Then create the migration connection in your application:
+
+```go
+db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
+if err != nil {
+    return err
+}
+defer db.Close()
+```
+
+Your application's normal runtime database access is independent of this.
+
+For example, an application may continue using `pgxpool.Pool` for repositories, queries, and transactions while providing a separate `*sql.DB` to the migration integration.
+
+## SQL migrations
+
+Instead of defining migrations in Go structures, use normal Goose SQL migration files:
+
+```text
+migrations/
+├── 00001_create_users.sql
+├── 00002_create_accounts.sql
+└── 00003_create_transactions.sql
+```
+
+For example:
+
+```sql
+-- +goose Up
+
+CREATE TABLE users (
+    id BIGSERIAL PRIMARY KEY,
+    email TEXT NOT NULL UNIQUE
+);
+
+-- +goose Down
+
+DROP TABLE users;
+```
+
+Goose owns migration discovery, ordering, transactions, version tracking, and SQL execution.
+
+Its default migration version table is `goose_db_version`.
+
+## Embedded migrations
+
+Embedded migrations work particularly well with an in-app CLI because the migration files can ship inside the application binary.
+
+Given:
+
+```text
+myapp/
+├── main.go
+└── migrations/
+    └── 00001_create_users.sql
+```
+
+embed the files:
+
+```go
+//go:embed migrations/*.sql
+var migrations embed.FS
+```
+
+The Goose extension expects the migration files at the root of the supplied filesystem, so use `fs.Sub`:
+
+```go
+migrationFS, err := fs.Sub(migrations, "migrations")
+if err != nil {
+    return err
+}
+```
+
+Then construct the migrator:
+
+```go
+migrator, err := goosecmd.New(db, migrationFS)
+if err != nil {
+    return err
+}
+```
+
+and compose it with cmdforge:
+
+```go
+cli := cmdforge.New()
+
+cli.Register("cache:clear", clearCache, false)
+cli.Use(migrator)
+
+cli.Start(ctx)
+```
+
+A complete setup looks like:
+
+```go
+package main
+
+import (
+    "context"
+    "database/sql"
+    "embed"
+    "io/fs"
+    "log"
+    "os"
+
+    _ "github.com/jackc/pgx/v5/stdlib"
+
+    "github.com/khalidhaykay/cmdforge"
+    goosecmd "github.com/khalidhaykay/cmdforge/goose"
+)
+
+//go:embed migrations/*.sql
+var migrations embed.FS
+
+func main() {
+    if err := run(context.Background()); err != nil {
         log.Fatal(err)
+    }
+}
+
+func run(ctx context.Context) error {
+    db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
+    if err != nil {
+        return err
     }
     defer db.Close()
 
-    cli := cmdforge.New(db, migrations)
+    migrationFS, err := fs.Sub(migrations, "migrations")
+    if err != nil {
+        return err
+    }
 
-    // Optional: register your own commands
-    cli.Register("seed", func(ctx context.Context) {
-        // seed logic
+    migrator, err := goosecmd.New(db, migrationFS)
+    if err != nil {
+        return err
+    }
+
+    cli := cmdforge.New()
+
+    cli.Register("cache:clear", func(ctx context.Context) {
+        log.Println("Clearing cache...")
     }, false)
 
+    cli.Use(migrator)
     cli.Start(ctx)
+
+    return nil
 }
 ```
 
-Build and run:
+`goosecmd.New` returns the migrator and any initialization error discovered while preparing the Goose Provider.
 
-```bash
-go build -o myapp ./cmd/cli
-./myapp db:migrate up
-```
+The extension accepts `fs.FS`, not a hardcoded directory. This means migration storage is controlled by the application.
 
----
-
-## Built-in commands
-
-These are registered automatically when you call `cmdforge.New()`.
-
-| Command             | Description                                     | Destructive |
-| ------------------- | ----------------------------------------------- | ----------- |
-| `list`              | Print all available commands                    | No          |
-| `db:migrate up`     | Apply all pending migrations                    | No          |
-| `db:migrate down`   | Roll back the last 5 applied migrations         | **Yes**     |
-| `db:migrate status` | Show applied / pending state for each migration | No          |
-| `db:reset`          | Roll back then re-apply all migrations          | **Yes**     |
-
-Destructive commands prompt the user to type `yes` before proceeding.
-
----
-
-## Custom commands
-
-Use `Register` to add any project-specific command:
+For example, you can use:
 
 ```go
-cli.Register("seed", seedHandler, false)
-cli.Register("db:truncate", truncateHandler, true) // will prompt for confirmation
+fs.Sub(embeddedFiles, "migrations")
 ```
 
-The handler signature is `func(ctx context.Context)`.
-
----
-
-## Migrations
-
-Define migrations as a `[]cmdforge.Migration` slice in your project. The package ships none — your schema is your business.
+or:
 
 ```go
-cmdforge.Migration{
-    Name: "000001_create_users_table", // must be unique; use a sortable prefix
-    Up:   `CREATE TABLE ...`,
-    Down: `DROP TABLE IF EXISTS ... CASCADE;`,
+os.DirFS("sql/changes")
+```
+
+or any other suitable `fs.FS`.
+
+The directory itself does not need to be named `migrations`.
+
+## Migration commands
+
+The Goose extension registers its commands only when it is explicitly composed with:
+
+```go
+cli.Use(migrator)
+```
+
+| Command              | Behavior                                          | Confirmation |
+| -------------------- | ------------------------------------------------- | ------------ |
+| `db:migrate up`      | Apply all pending migrations                      | No           |
+| `db:migrate down`    | Roll back the most recently applied migration     | Yes          |
+| `db:migrate status`  | Show migration status                             | No           |
+| `db:migrate reset`   | Roll back all applied migrations                  | Yes          |
+| `db:migrate refresh` | Roll back all applied migrations and reapply them | Yes          |
+
+The integration delegates migration behavior to the Goose Provider rather than implementing its own migration engine.
+
+`db:migrate refresh` is a cmdforge convenience operation that performs a full rollback followed by migration up. It stops if the rollback fails.
+
+Reset and refresh operate only through migration SQL. They do not drop the database or unrelated tables.
+
+## Error and process behavior
+
+Unknown commands and command execution failures are reported as errors and terminate command execution with a non-zero status.
+
+Because process termination does not run deferred functions, application cleanup registered with `defer` is not guaranteed to execute on fatal command failures.
+
+Normal command completion returns control to the application.
+
+## Standalone example
+
+A complete runnable example is available in [`example/`](example/).
+
+It is intentionally a standalone Go module so that the core cmdforge package remains independent of the example application's database choices.
+
+With a PostgreSQL database available:
+
+```sh
+cd example
+
+export DATABASE_URL='postgres://postgres:postgres@localhost:5432/myapp?sslmode=disable'
+
+go run . list
+go run . db:migrate up
+go run . db:migrate status
+```
+
+The example uses embedded migrations and pgx's `database/sql` driver.
+
+## Upgrading from the old v0.x API
+
+This release replaces cmdforge's custom PostgreSQL migration engine with the optional Goose integration.
+
+Replace:
+
+```go
+cli := cmdforge.New(db, migrations)
+```
+
+with:
+
+```go
+cli := cmdforge.New()
+```
+
+Replace programmatic migration definitions such as:
+
+```go
+[]cmdforge.Migration{
+    {
+        Name: "...",
+        Up:   "...",
+        Down: "...",
+    },
 }
 ```
 
-Migration state is tracked in a `schema_migrations` table that the package creates automatically on first `db:migrate up`.
+with numbered Goose SQL migration files containing `-- +goose Up` and `-- +goose Down` sections.
 
-**Name uniqueness matters** — the name is the key used to track whether a migration has been applied. Changing a name after it's been applied will cause the runner to treat it as a new, unapplied migration.
+Then explicitly construct and register the Goose integration:
 
----
+```go
+migrator, err := goosecmd.New(db, migrationFS)
+if err != nil {
+    return err
+}
 
-## Notes
-
-- **PostgreSQL only (v1).** The migration handler is built on `*pgxpool.Pool` and uses Postgres-specific SQL (`$1` placeholders, `SERIAL`). Abstracting this away would be false generality since the migration SQL itself is Postgres-flavored anyway.
-- **`db:migrate down` rolls back the last 5** applied migrations, not all of them. This is intentional to avoid accidental full rollbacks. Use `db:reset` if you want a full wipe and re-apply.
-- **No file-based migrations.** Migrations live in Go code as strings. This keeps the tool dependency-free and makes migrations part of your binary.
-
----
-
-## Project structure
-
+cli.Use(migrator)
 ```
-cmdforge/
-├── cli.go        # Public entry point: New(), Register(), Start()
-├── cmd.go        # Command router and destructive-op confirmation
-├── handler.go    # Built-in db migration command implementations
-├── type.go       # Public types: Command, Migration, Schema
-├── go.mod
-└── example/
-    └── main.go   # Example of a consuming project
+
+`Migration`, `Schema`, and cmdforge's custom migration engine have been removed.
+
+Your application may independently continue using `pgxpool` or another database abstraction for its normal runtime access.
+
+### Important: existing migration history
+
+The old `schema_migrations` history is **not automatically converted** into Goose's `goose_db_version` history.
+
+Do not simply run the new Goose migrations against an existing production database that was migrated using the old cmdforge engine.
+
+Existing databases require an application-managed migration/baseline strategy before adopting the new migration integration.
+
+## Development
+
+Run formatting and checks from the repository root:
+
+```sh
+gofmt -w *.go goose/*.go
+go test ./...
+go vet ./...
+```
+
+The Goose integration tests exercise the real Goose Provider against a mocked SQL connection and do not require a running PostgreSQL server.
+
+The standalone example can be checked separately:
+
+```sh
+cd example
+
+go test ./...
+go vet ./...
 ```

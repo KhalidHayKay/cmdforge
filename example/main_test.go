@@ -1,45 +1,32 @@
 package main
 
 import (
-	"context"
-	"io"
-	"os"
+	"database/sql"
+	"io/fs"
 	"testing"
 
-	"github.com/khalidhaykay/cmdforge"
+	goosecmd "github.com/khalidhaykay/cmdforge/goose"
 )
 
-func TestExampleRegistersAndRunsSeedCommand(t *testing.T) {
-	cli := cmdforge.New(nil, migrations)
-	cli.Register("seed", func(ctx context.Context) {
-		// Example seed logic is intentionally for tests.
-	}, false)
-
-	prevArgs := os.Args
-	defer func() { os.Args = prevArgs }()
-	os.Args = []string{"cmd", "seed"}
-
-	oldStderr := os.Stderr
-	r, w, err := os.Pipe()
+func TestEmbeddedMigrations(t *testing.T) {
+	migrationFS, err := fs.Sub(migrations, "migrations")
 	if err != nil {
 		t.Fatal(err)
 	}
-	os.Stderr = w
-	defer func() {
-		_ = w.Close()
-		os.Stderr = oldStderr
-	}()
-
-	done := make(chan struct{})
-	go func() {
-		_, _ = io.Copy(io.Discard, r)
-		close(done)
-	}()
-
-	cli.Start(context.Background())
-
-	if err := w.Close(); err != nil {
+	files, err := fs.Glob(migrationFS, "*.sql")
+	if err != nil {
 		t.Fatal(err)
 	}
-	<-done
+	if len(files) != 2 {
+		t.Fatalf("expected two embedded migrations, got %v", files)
+	}
+	// sql.Open is lazy: constructing the extension needs no running server.
+	db, err := sql.Open("pgx", "postgres://localhost/example?sslmode=disable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := goosecmd.New(db, migrationFS); err != nil {
+		t.Fatal(err)
+	}
 }

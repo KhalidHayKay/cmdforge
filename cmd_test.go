@@ -127,7 +127,7 @@ func TestCMDRunDestructiveConfirmation(t *testing.T) {
 }
 
 func TestCLIRegisterAndStart(t *testing.T) {
-	cli := New(nil, nil)
+	cli := New()
 	var executed bool
 	cli.Register("seed", func(ctx context.Context) {
 		executed = true
@@ -141,5 +141,71 @@ func TestCLIRegisterAndStart(t *testing.T) {
 
 	if !executed {
 		t.Fatal("expected registered CLI command to run")
+	}
+}
+
+// An application-owned group needs only Register; it has no lifecycle hooks.
+type testCommands struct {
+	name string
+	run  func(context.Context)
+}
+
+func (g testCommands) Register(cli *CLI) {
+	cli.Register(g.name, g.run, false)
+}
+
+var _ Extension = testCommands{}
+
+func TestCLIComposition(t *testing.T) {
+	cli := New()
+	if len(cli.cmd.commands) != 1 {
+		t.Fatalf("new CLI should only register list: %v", cli.cmd.commands)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var calls []string
+	handler := func(name string) func(context.Context) {
+		return func(got context.Context) {
+			if got != ctx {
+				t.Error("handler did not receive Start's context")
+			}
+			calls = append(calls, name)
+		}
+	}
+	cli.Register("cache:clear", handler("cache"), false)
+	testCommands{"user:create", handler("user")}.Register(cli)
+	cli.Use(testCommands{"queue drain", handler("queue")})
+	cli.Use(testCommands{"report generate", handler("report")})
+	oldArgs := os.Args
+	defer func() { os.Args = oldArgs }()
+	for _, name := range []string{"cache:clear", "user:create", "queue drain", "report generate"} {
+		os.Args = append([]string{"app"}, strings.Fields(name)...)
+		cli.Start(ctx)
+	}
+	if got := strings.Join(calls, ","); got != "cache,user,queue,report" {
+		t.Fatalf("calls = %s", got)
+	}
+	os.Args = []string{"app", "list"}
+	output := captureStdout(t, func() { cli.Start(ctx) })
+	if output != "Available commands:\n- cache:clear\n- queue drain\n- report generate\n- user:create\n" {
+		t.Fatalf("list = %q", output)
+	}
+}
+
+func TestRegisterReplacesCommand(t *testing.T) {
+	cli := New()
+	cli.Use(testCommands{"task", func(context.Context) { t.Fatal("old command ran") }})
+	called := false
+	cli.Register("task", func(context.Context) { called = true }, true)
+	oldArgs := os.Args
+	defer func() { os.Args = oldArgs }()
+	os.Args = []string{"app", "task"}
+	withStdin("no\n", func() { cli.Start(context.Background()) })
+	if called {
+		t.Fatal("replacement lost destructive flag")
+	}
+	withStdin("yes\n", func() { cli.Start(context.Background()) })
+	if !called {
+		t.Fatal("replacement did not run")
 	}
 }

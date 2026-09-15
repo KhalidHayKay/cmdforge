@@ -11,8 +11,7 @@ import (
 )
 
 // CMD is the command router. It holds a map of named commands and dispatches
-// to the right one based on os.Args. This is the core of the package —
-// migrations are just pre-registered commands on top of this.
+// to the right one based on os.Args.
 type CMD struct {
 	commands map[string]Command
 }
@@ -34,9 +33,7 @@ func newCMD() *CMD {
 	}
 }
 
-// add registers a new command by name. This is called internally by the CLI
-// struct to wire up the built-in db commands, and exposed via CLI.Register
-// for the caller to add their own.
+// add registers a new command by name through CLI.Register.
 func (c *CMD) add(name string, handler func(context.Context), destructive bool) {
 	c.commands[name] = Command{
 		Run:         handler,

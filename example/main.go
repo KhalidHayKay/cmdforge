@@ -2,64 +2,53 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"embed"
+	"io/fs"
 	"log"
 	"os"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/joho/godotenv"
 	"github.com/khalidhaykay/cmdforge"
+	goosecmd "github.com/khalidhaykay/cmdforge/goose"
 )
 
-// migrations is your project's own migration list.
-// The package ships none — this is intentional; every project defines its own schema.
-var migrations = []cmdforge.Migration{
-	{
-		Name: "000001_create_users_table",
-		Up: `CREATE TABLE users (
-			id BIGSERIAL PRIMARY KEY,
-			email TEXT NOT NULL UNIQUE,
-			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);`,
-		Down: `DROP TABLE IF EXISTS users CASCADE;`,
-	},
-	{
-		Name: "000002_create_posts_table",
-		Up: `CREATE TABLE posts (
-			id BIGSERIAL PRIMARY KEY,
-			user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			title TEXT NOT NULL,
-			body TEXT,
-			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-		);`,
-		Down: `DROP TABLE IF EXISTS posts CASCADE;`,
-	},
-}
+//go:embed migrations/*.sql
+var migrations embed.FS
 
 func main() {
-	ctx := context.Background()
+	err := godotenv.Load()
+	if err != nil {
+		log.Fatal("Error loading .env file")
+	}
 
-	godotenv.Load()
-
-	// You own the db connection. The package doesn't care how you build it —
-	// env var, config file, secrets manager, whatever your project uses.
-	db, err := pgxpool.New(ctx, os.Getenv("DATABASE_URL"))
+	log.Println(os.Getenv("DATABASE_URL"))
+	// Configuration and connection ownership belong to this application.
+	db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
-	cli := cmdforge.New(db, migrations)
+	migrationFS, err := fs.Sub(migrations, "migrations")
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	// Register any project-specific commands on top of the built-in ones.
-	cli.Register("seed", func(ctx context.Context) {
-		log.Println("Seeding database...")
-		// your seed logic here
+	migrator, err := goosecmd.New(db, migrationFS)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	cli := cmdforge.New()
+
+	cli.Register("cache:clear", func(ctx context.Context) {
+		log.Println("Clearing the application cache...")
+		// Call your application's cache service here.
 	}, false)
 
-	cli.Register("db:truncate", func(ctx context.Context) {
-		log.Println("Truncating all tables...")
-		// your truncate logic here
-	}, true) // destructive = true means it will prompt for confirmation
+	cli.Use(migrator)
 
-	cli.Start(ctx)
+	cli.Start(context.Background())
 }
