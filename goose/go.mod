@@ -5,7 +5,7 @@ go 1.26.0
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/jackc/pgx/v5 v5.10.0
-	github.com/khalidhaykay/cmdforge v0.2.0-rc.1
+	github.com/khalidhaykay/cmdforge v0.2.0-rc.2
 	github.com/pressly/goose/v3 v3.28.0
 )
 
