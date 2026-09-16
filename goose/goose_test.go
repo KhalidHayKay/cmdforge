@@ -37,7 +37,7 @@ func newTestMigrator(t *testing.T) (*Migrator, *sql.DB, sqlmock.Sqlmock) {
 			t.Error(err)
 		}
 	})
-	migrator, err := New(db, migrationFiles)
+	migrator, err := NewWithDB(db, migrationFiles)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func newTestMigrator(t *testing.T) (*Migrator, *sql.DB, sqlmock.Sqlmock) {
 }
 
 func TestNewErrors(t *testing.T) {
-	if m, err := New(nil, migrationFiles); err == nil || m != nil {
+	if m, err := NewWithDB(nil, migrationFiles); err == nil || m != nil {
 		t.Fatal("expected nil database error")
 	}
 	_, db, _ := newTestMigrator(t)
@@ -53,11 +53,11 @@ func TestNewErrors(t *testing.T) {
 		"00001_a.sql": {Data: []byte("-- +goose Up\nSELECT 1;")},
 		"00001_b.sql": {Data: []byte("-- +goose Up\nSELECT 2;")},
 	}} {
-		if m, err := New(db, files); err == nil || m != nil {
+		if m, err := NewWithDB(db, files); err == nil || m != nil {
 			t.Fatal("expected migration discovery error")
 		}
 	}
-	_, err := New(db, os.DirFS(t.TempDir()+"/missing"))
+	_, err := NewWithDB(db, os.DirFS(t.TempDir()+"/missing"))
 	if !errors.Is(err, pressly.ErrNoMigrations) {
 		t.Fatalf("expected Goose discovery error, got %v", err)
 	}
@@ -223,4 +223,158 @@ func TestContextAndEmptyRollback(t *testing.T) {
 
 func expectLatest(mock sqlmock.Sqlmock, version int) {
 	mock.ExpectQuery("SELECT max").WillReturnRows(sqlmock.NewRows([]string{"max"}).AddRow(version))
+}
+
+func TestURLConstructor(t *testing.T) {
+	m, err := New("postgres://localhost/example?sslmode=disable", migrationFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.provider != nil || m.openProvider == nil {
+		t.Fatal("constructor retained an owned pool")
+	}
+	runCLI(t, m, "list", "")
+	runCLI(t, m, "db:migrate refresh", "no\n")
+	if _, err := New("postgres://localhost:invalid/example", migrationFiles); err == nil {
+		t.Fatal("expected invalid URL error")
+	}
+	if _, err := New("postgres://localhost/example", fstest.MapFS{}); err == nil {
+		t.Fatal("expected provider construction error")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := m.up(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("up = %v", err)
+	}
+}
+
+func TestOwnedLifecycle(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(map[bool]string{false: "success", true: "failure"}[fail], func(t *testing.T) {
+			var dbs []*sql.DB
+			opens := 0
+			failure := errors.New("query failed")
+			openDB := func() (*sql.DB, error) {
+				db, mock, err := sqlmock.New()
+				if err != nil {
+					t.Fatal(err)
+				}
+				dbs = append(dbs, db)
+				opens++
+				if opens > 1 {
+					if fail {
+						mock.ExpectQuery("SELECT EXISTS").WillReturnError(failure)
+					} else {
+						expectTable(mock)
+						expectVersions(mock, 2, 1, 0)
+					}
+				}
+				mock.ExpectClose()
+				t.Cleanup(func() {
+					if err := mock.ExpectationsWereMet(); err != nil {
+						t.Error(err)
+					}
+				})
+				return db, nil
+			}
+			m, err := newOwned(openDB, migrationFiles)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runCLI(t, m, "list", "")
+			runCLI(t, m, "db:migrate reset", "no\n")
+			if opens != 1 {
+				t.Fatal("listing or cancellation opened a pool")
+			}
+			for i := 0; i < 2; i++ {
+				err := m.up(context.Background())
+				if fail && !errors.Is(err, failure) || !fail && err != nil {
+					t.Fatalf("up = %v", err)
+				}
+			}
+			if opens != 3 {
+				t.Fatalf("opens = %d", opens)
+			}
+			for _, db := range dbs {
+				if err := db.Ping(); err == nil || !strings.Contains(err.Error(), "closed") {
+					t.Fatalf("pool not closed: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestOwnedConstructionCleanup(t *testing.T) {
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mock.ExpectClose()
+	if _, err := newOwned(func() (*sql.DB, error) { return db, nil }, fstest.MapFS{}); !errors.Is(err, pressly.ErrNoMigrations) {
+		t.Fatalf("New = %v", err)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatal(err)
+	}
+	failure := errors.New("open failed")
+	if _, err := newOwned(func() (*sql.DB, error) { return nil, failure }, migrationFiles); !errors.Is(err, failure) {
+		t.Fatalf("New = %v", err)
+	}
+}
+
+func TestOwnedRefreshSharesPool(t *testing.T) {
+	opens := 0
+	m, err := newOwned(func() (*sql.DB, error) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			return nil, err
+		}
+		opens++
+		if opens > 1 {
+			expectTable(mock)
+			expectVersions(mock, 2, 1, 0)
+			expectMigration(mock, "posts", 2, false)
+			expectMigration(mock, "users", 1, false)
+			expectLatest(mock, 0)
+			expectVersions(mock, 0)
+			expectVersions(mock, 0)
+			expectMigration(mock, "users", 1, true)
+			expectMigration(mock, "posts", 2, true)
+			expectLatest(mock, 2)
+		}
+		mock.ExpectClose()
+		t.Cleanup(func() {
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Error(err)
+			}
+		})
+		return db, nil
+	}, migrationFiles)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCLI(t, m, "db:migrate refresh", "yes\n")
+	if opens != 2 {
+		t.Fatalf("refresh opened multiple pools: %d", opens)
+	}
+}
+
+func TestOwnedCloseError(t *testing.T) {
+	failure := errors.New("close failed")
+	_, err := newOwned(func() (*sql.DB, error) {
+		db, mock, err := sqlmock.New()
+		if err != nil {
+			return nil, err
+		}
+		mock.ExpectClose().WillReturnError(failure)
+		t.Cleanup(func() {
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Error(err)
+			}
+		})
+		return db, nil
+	}, migrationFiles)
+	if !errors.Is(err, failure) {
+		t.Fatalf("New = %v", err)
+	}
 }
