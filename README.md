@@ -6,7 +6,7 @@ Use your application's existing services to run maintenance tasks, seed data, ma
 
 **`Register` is the primary way to add commands. `Extension` and `Use` provide an optional way to group and compose related commands.**
 
-> cmdforge owns commands and composition. Extensions own their integrations. Applications own configuration and resources unless an extension explicitly offers a convenience API that owns a resource internally.
+> cmdforge owns commands and composition. Extensions own their integrations.
 
 ## Install
 
@@ -14,9 +14,9 @@ Use your application's existing services to run maintenance tasks, seed data, ma
 go get github.com/khalidhaykay/cmdforge
 ```
 
-> **Go versions:** Core declares Go 1.22 (its existing standard-library code and tests need no newer features). The Goose extension and example require Go 1.26 because Goose v3.28.0 requires it.
+The core module requires **Go 1.22 or newer** and uses only the Go standard library.
 
-The core module uses only the Go standard library. Installing core does not bring Goose, pgx, or any database dependencies into its module graph. cmdforge is a command runner, not a migration framework.
+Optional integrations are distributed independently and do not add their dependencies or Go version requirements to cmdforge core.
 
 ## Quick start
 
@@ -41,7 +41,7 @@ func main() {
 }
 ```
 
-Run the command through your application:
+Run commands through your application:
 
 ```sh
 go run . list
@@ -50,7 +50,7 @@ go run . hello
 
 `New()` includes a built-in `list` command that prints the registered command names.
 
-That's the basic cmdforge model:
+The basic cmdforge model is:
 
 ```text
 New
@@ -92,7 +92,7 @@ Command names may contain spaces:
 cli.Register("queue drain", drainQueue, false)
 ```
 
-Cmdforge performs exact command matching. It does not provide flag or argument parsing.
+cmdforge performs exact command matching. It does not provide flag or argument parsing.
 
 ### Destructive commands
 
@@ -108,7 +108,7 @@ Before executing a destructive command, cmdforge asks the user to type `yes`. An
 
 Registering an existing command name replaces its current handler and destructive setting.
 
-This allows commands to be deliberately overridden, but also means extensions can replace previously registered commands with the same name. Be deliberate when composing command groups that may share command names.
+This allows deliberate overrides, but also means an extension can replace a previously registered command with the same name.
 
 ## Grouping commands with extensions
 
@@ -139,7 +139,7 @@ func (u UserCommands) Register(cli *cmdforge.CLI) {
 Then compose it with the CLI:
 
 ```go
-appCommands := UserCommands{
+userCommands := UserCommands{
     Create: createUser,
     Delete: deleteUser,
 }
@@ -147,12 +147,12 @@ appCommands := UserCommands{
 cli := cmdforge.New()
 
 cli.Register("cache:clear", clearCache, false)
-cli.Use(appCommands)
+cli.Use(userCommands)
 
 cli.Start(ctx)
 ```
 
-`Use` is simply:
+`Use` simply asks an extension to register its commands:
 
 ```go
 func (c *CLI) Use(extension Extension) {
@@ -160,11 +160,11 @@ func (c *CLI) Use(extension Extension) {
 }
 ```
 
-There are no lifecycle hooks, initialization phases, dependency resolution, or plugin machinery.
+There are no lifecycle hooks, dependency resolution, or plugin machinery.
 
 Extensions are optional. Calling `Register` directly is always valid.
 
-Multiple related command groups can be composed in the same way:
+Multiple command groups and integrations can be composed in the same application:
 
 ```go
 cli.Use(userCommands)
@@ -174,43 +174,56 @@ cli.Use(migrator)
 
 ## Goose extension
 
-The optional, independent `github.com/khalidhaykay/cmdforge/goose` module integrates [Goose](https://github.com/pressly/goose) through `Extension.Register(*CLI)`. Core depends on no migration engine. The extension currently targets PostgreSQL.
+`github.com/khalidhaykay/cmdforge/goose` is an independent optional module that exposes PostgreSQL migration commands through cmdforge using Goose.
 
-Once the module split is released, install the extension with:
+cmdforge core does not depend on Goose, pgx, or any migration engine.
+
+Install the extension separately:
 
 ```sh
 go get github.com/khalidhaykay/cmdforge/goose
 ```
 
-For this unreleased checkout, use the repository workspace; see the release-order limitation under Development.
+The Goose extension currently requires **Go 1.26 or newer** and targets PostgreSQL.
 
-The common API accepts an application-provided database URL and an `fs.FS`:
+### Basic usage
+
+The common API accepts a PostgreSQL database URL and an `fs.FS` containing your migrations:
 
 ```go
 migrator, err := goosecmd.New(databaseURL, migrations.FS)
 if err != nil {
     return err
 }
+
+cli := cmdforge.New()
 cli.Use(migrator)
+
+cli.Start(ctx)
 ```
 
-The extension uses pgx's stdlib adapter internally. It validates the connection configuration and discovers migrations at construction without contacting PostgreSQL. It retains no open pool between commands. Each executed migration command creates a fresh pool and Goose Provider and closes the pool on success or failure before reporting fatal errors. Refresh uses one pool for both rollback and reapply. Listing commands or declining confirmation needs no database connection. Repeated command execution is supported; no `defer migrator.Close()` is necessary.
+`New` manages the database resources required by migration commands internally. Applications do not need to import a SQL driver, create a separate `*sql.DB`, or close migration resources.
 
-Database connectivity and SQL parsing errors are discovered during command execution. Migration files are rediscovered for each command, so an on-disk filesystem may reflect changes since construction. The extension does not read application configuration or manage application runtime database access.
+Your application's normal database setup remains independent. For example, the application can continue using `pgxpool` for runtime queries while the Goose extension manages its own migration connections.
 
-For advanced caller-owned connections:
+### Using an existing `*sql.DB`
+
+Applications that need explicit connection ownership can use `NewWithDB`:
 
 ```go
 migrator, err := goosecmd.NewWithDB(db, migrations.FS)
+if err != nil {
+    return err
+}
 ```
 
-The caller creates and owns `db` and is responsible for closing it. `NewWithDB` never closes it, even when construction or execution fails. This API also uses PostgreSQL. Both constructors share the same Provider configuration and command behavior; Goose's global Go-migration registry is disabled.
+With `NewWithDB`, the caller owns `db` and remains responsible for closing it. The extension never closes a caller-provided database.
 
-Other migration engines can be independent extensions/modules alongside Goose, without changing core or existing Goose consumers. Engine-specific history and any engine switch or baselining remain application concerns.
+Both constructors use PostgreSQL and expose the same migration commands.
 
 ## SQL migrations
 
-Instead of defining migrations in Go structures, use normal Goose SQL migration files:
+The Goose extension uses standard Goose SQL migration files:
 
 ```text
 migrations/
@@ -234,15 +247,15 @@ CREATE TABLE users (
 DROP TABLE users;
 ```
 
-Goose owns migration discovery, ordering, transactions, version tracking, and SQL execution.
+Goose owns migration discovery, ordering, execution, transactions, and version tracking.
 
 Its default migration version table is `goose_db_version`.
 
 ## Embedded migrations
 
-Embedded migrations work particularly well with an in-app CLI because the migration files can ship inside the application binary.
+Embedded migrations work particularly well with an in-app CLI because the migration files ship with the application binary.
 
-Prefer a dedicated resource package because Go embed patterns are package-relative:
+A dedicated migrations package keeps the files independent of your CLI package:
 
 ```text
 application/
@@ -255,7 +268,7 @@ application/
     └── 00002_create_posts.sql
 ```
 
-`migrations/embed.go`:
+In `migrations/embed.go`:
 
 ```go
 package migrations
@@ -266,7 +279,7 @@ import "embed"
 var FS embed.FS
 ```
 
-`cmd/cli/main.go` (replace `application` with your module path):
+Then consume that filesystem from your CLI:
 
 ```go
 package main
@@ -277,29 +290,40 @@ import (
     "os"
 
     "application/migrations"
+
     "github.com/khalidhaykay/cmdforge"
     goosecmd "github.com/khalidhaykay/cmdforge/goose"
 )
 
 func main() {
-    migrator, err := goosecmd.New(os.Getenv("DATABASE_URL"), migrations.FS)
+    migrator, err := goosecmd.New(
+        os.Getenv("DATABASE_URL"),
+        migrations.FS,
+    )
     if err != nil {
         log.Fatal(err)
     }
+
     cli := cmdforge.New()
+
     cli.Register("cache:clear", func(ctx context.Context) {
         log.Println("Clearing cache...")
     }, false)
+
     cli.Use(migrator)
     cli.Start(context.Background())
 }
 ```
 
-The API accepts `fs.FS`, including `embed.FS`, `os.DirFS(...)`, `fs.Sub(...)`, and custom implementations. SQL files must be at the supplied filesystem's root. Use `fs.Sub` when selecting a nested directory in an existing embedded filesystem.
+Replace `application/migrations` with your application's module path.
+
+The extension accepts `fs.FS`, so migrations do not have to be embedded. You can also use `os.DirFS(...)`, `fs.Sub(...)`, or another `fs.FS` implementation.
+
+Migration SQL files must be at the root of the filesystem supplied to the extension. Use `fs.Sub` when selecting a nested migration directory from an existing filesystem.
 
 ## Migration commands
 
-The Goose extension registers its commands only when it is explicitly composed with:
+The Goose extension registers its commands when composed with:
 
 ```go
 cli.Use(migrator)
@@ -313,17 +337,15 @@ cli.Use(migrator)
 | `db:migrate reset`   | Roll back all applied migrations                  | Yes          |
 | `db:migrate refresh` | Roll back all applied migrations and reapply them | Yes          |
 
-The integration delegates migration behavior to the Goose Provider rather than implementing its own migration engine.
+`db:migrate refresh` is a cmdforge convenience command that performs a full rollback followed by migration up. If rollback fails, migration up is not attempted.
 
-`db:migrate refresh` is a cmdforge convenience operation that performs a full rollback followed by migration up. It stops if the rollback fails.
-
-Reset and refresh operate only through migration SQL. They do not drop the database or unrelated tables.
+Reset and refresh operate through your migration SQL. They do not drop the database or unrelated tables.
 
 ## Error and process behavior
 
-Unknown commands and command execution failures are reported as errors and terminate command execution with a non-zero status.
+Unknown commands and command execution failures terminate command execution with a non-zero status.
 
-Because process termination does not run deferred functions, application cleanup registered with `defer` is not guaranteed to execute on fatal command failures.
+Because process termination does not execute deferred functions, cleanup registered with `defer` is not guaranteed to run after a fatal command failure.
 
 Normal command completion returns control to the application.
 
@@ -331,7 +353,13 @@ Normal command completion returns control to the application.
 
 A complete runnable example is available in [`example/`](example/).
 
-It is intentionally a standalone Go module so that the core cmdforge package remains independent of the example application's database choices.
+The example is a standalone Go module and demonstrates:
+
+- core command registration
+- the independent Goose extension
+- PostgreSQL migrations
+- a dedicated embedded-migrations package
+- the database URL constructor
 
 With a PostgreSQL database available:
 
@@ -345,11 +373,11 @@ go run . db:migrate up
 go run . db:migrate status
 ```
 
-The example uses a dedicated embedded-migrations package and the URL constructor; it needs no SQL or driver imports. It loads configuration from a `.env` file.
+## Upgrading from v0.1.x
 
-## Upgrading from the old v0.x API
+cmdforge v0.2 removes the custom PostgreSQL migration engine from core.
 
-Core no longer contains the legacy PostgreSQL migration engine. Applications can opt into the independent Goose extension.
+Applications that need migrations can opt into the independent Goose extension.
 
 Replace:
 
@@ -363,7 +391,17 @@ with:
 cli := cmdforge.New()
 ```
 
-Replace programmatic migration definitions such as:
+The core command APIs remain:
+
+```go
+cli.Register(...)
+cli.Use(...)
+cli.Start(...)
+```
+
+### Migrating to Goose
+
+Programmatic cmdforge migrations such as:
 
 ```go
 []cmdforge.Migration{
@@ -375,9 +413,9 @@ Replace programmatic migration definitions such as:
 }
 ```
 
-with numbered Goose SQL migration files containing `-- +goose Up` and `-- +goose Down` sections.
+should be replaced with numbered Goose SQL migration files containing `-- +goose Up` and `-- +goose Down` sections.
 
-Then explicitly construct and register the Goose integration:
+Then construct and register the Goose extension:
 
 ```go
 migrator, err := goosecmd.New(databaseURL, migrationFS)
@@ -390,35 +428,58 @@ cli.Use(migrator)
 
 `Migration`, `Schema`, and cmdforge's custom migration engine have been removed.
 
-Your application may independently continue using `pgxpool` or another database abstraction for its normal runtime access.
+Your application can continue using `pgxpool` or another database abstraction independently for normal runtime access.
 
-### Important: existing migration history
+### Existing databases
+
+The legacy cmdforge migration engine and Goose maintain separate migration histories.
 
 The old `schema_migrations` history is **not automatically converted** into Goose's `goose_db_version` history.
 
-Do not simply run the new Goose migrations against an existing production database that was migrated using the old cmdforge engine.
+Do not run a new set of initial Goose migrations against an existing production database as though the database were empty. Existing databases require an application-specific migration or baselining strategy that reconciles the existing schema with Goose's migration state.
 
-Existing databases require an application-managed migration/baseline strategy before adopting Goose. Preserve the existing schema and data: deleting the schema is not a required upgrade step. Reconcile the already-applied schema with Goose version state through a strategy reviewed for your application. This extension performs no automatic history conversion.
+Your existing schema and data do not need to be deleted to adopt the Goose extension.
 
-RC.1 callers of `goosecmd.New(db, migrationFS)` should use `NewWithDB(db, migrationFS)` to retain caller ownership, or switch to `New(databaseURL, migrationFS)` for internal resource management. The core `New`, `Register`, `Use`, and `Start` APIs are unchanged.
+cmdforge performs no automatic migration-history conversion.
 
 ## Development
 
-The repository contains three modules: core (`.`), the optional Goose extension (`goose/`), and the standalone example (`example/`). `go.work` selects all three for local development. Go 1.26 or newer is required to work across them. Core can be checked independently with `GOWORK=off` on its own minimum Go version.
+The repository contains three Go modules:
 
-Run formatting, tests, and vet separately for every module:
+```text
+.
+├── go.mod          # cmdforge core
+├── goose/
+│   └── go.mod      # Goose extension
+└── example/
+    └── go.mod      # standalone example
+```
+
+`go.work` connects them for local repository development.
+
+Core requires Go 1.22 or newer. Working across the Goose extension and example requires Go 1.26 or newer.
+
+Run checks for each module:
 
 ```sh
-gofmt -w *.go
+# Core
 go test ./...
 go vet ./...
 
-(cd goose && gofmt -w *.go && go test ./... && go vet ./...)
-(cd example && gofmt -w *.go migrations/*.go && go test ./... && go vet ./... && go build ./...)
+# Goose extension
+cd goose
+go test ./...
+go vet ./...
+
+# Example
+cd ../example
+go test ./...
+go vet ./...
+go build ./...
 ```
 
-Goose tests exercise the real Provider with mocked SQL connections and test URL configuration without an external PostgreSQL server. The example has local replacements for both repository modules so it can also be checked with `GOWORK=off`; these are example-development settings. The Goose module has no local replacement.
+The Goose tests use mocked SQL connections and do not require a running PostgreSQL server.
 
-### Release-order limitation
+## License
 
-The Goose module currently records the real core version `v0.2.0-rc.1`. That tag still contains the old `goose` package, so using it with the new Goose module outside the workspace produces an ambiguous import. **This checkout is not ready to publish unchanged.** First release the split core (whose module archive excludes the nested Goose module), then update `goose/go.mod` to require that real version and validate with `GOWORK=off`. Release the extension using a `goose/`-prefixed version tag, and update the example to the released versions. The example's provisional Goose version is resolved locally until that release exists. No release or tag is created by this refactor.
+cmdforge is licensed under the [MIT License](LICENSE).
