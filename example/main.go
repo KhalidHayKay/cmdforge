@@ -2,20 +2,14 @@ package main
 
 import (
 	"context"
-	"database/sql"
-	"embed"
-	"io/fs"
 	"log"
 	"os"
 
-	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/joho/godotenv"
 	"github.com/khalidhaykay/cmdforge"
+	"github.com/khalidhaykay/cmdforge/example/migrations"
 	goosecmd "github.com/khalidhaykay/cmdforge/goose"
 )
-
-//go:embed migrations/*.sql
-var migrations embed.FS
 
 func main() {
 	err := godotenv.Load()
@@ -23,20 +17,7 @@ func main() {
 		log.Fatal("Error loading .env file")
 	}
 
-	log.Println(os.Getenv("DATABASE_URL"))
-	// Configuration and connection ownership belong to this application.
-	db, err := sql.Open("pgx", os.Getenv("DATABASE_URL"))
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer db.Close()
-
-	migrationFS, err := fs.Sub(migrations, "migrations")
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	migrator, err := goosecmd.New(db, migrationFS)
+	migrator, err := goosecmd.New(os.Getenv("DATABASE_URL"), migrations.FS)
 	if err != nil {
 		log.Fatal(err)
 	}
